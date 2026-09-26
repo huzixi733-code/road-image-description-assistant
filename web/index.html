@@ -295,11 +295,16 @@
   <canvas id="hidden-canvas" style="display: none;"></canvas>
 
   <script>
-    const DEFAULT_OLLAMA_URL = `http://${location.hostname || '127.0.0.1'}:11434/api/chat`;
+    const DEFAULT_OLLAMA_URL = location.protocol === 'https:'
+      ? `${location.origin}/api/chat`
+      : `http://${location.hostname || '127.0.0.1'}:11434/api/chat`;
+    const SAVED_OLLAMA_URL = localStorage.getItem('ollama_url');
+    const SAVED_TTS_RATE = Number.parseFloat(localStorage.getItem('tts_rate') || '1.0');
+    const MAX_IMAGE_EDGE = 1280;
     const CONFIG = {
-      apiEndpoint: localStorage.getItem('ollama_url') || DEFAULT_OLLAMA_URL,
+      apiEndpoint: location.protocol === 'https:' ? DEFAULT_OLLAMA_URL : (SAVED_OLLAMA_URL || DEFAULT_OLLAMA_URL),
       modelName: localStorage.getItem('ollama_model') || 'qwen3-vl:8b-instruct-q4_K_M',
-      ttsRate: parseFloat(localStorage.getItem('tts_rate') || '1.0'),
+      ttsRate: Number.isFinite(SAVED_TTS_RATE) ? SAVED_TTS_RATE : 1.0,
       systemPrompt: `任务:你是面向视障用户的道路图片描述助手。直接从关键目标及其位置开始,不使用“这是一张图片”“这是街景”等开场。
 信息顺序:优先描述清楚可见的近处障碍、台阶、坑洞、围挡和被占通道;其次描述行人、车辆、道路、路口、信号灯、标志与护栏的位置和空间关系。天空、天气和景观仅在影响识别时说明。
 方位:区分画面左、中、右与道路左、右车道。仅在透视明确时使用前方、近处、远处;不得仅凭目标在画面中的上下位置判断远近。
@@ -354,7 +359,7 @@
 
       const utterance = new SpeechSynthesisUtterance(text);
       utterance.lang = 'zh-CN';
-      utterance.rate = CONFIG.ttsRate;
+      utterance.rate = Number.isFinite(CONFIG.ttsRate) ? CONFIG.ttsRate : 1.0;
       window.speechSynthesis.speak(utterance);
     }
 
@@ -383,12 +388,13 @@
 
     function captureVideoFrame() {
       if (!videoElem.videoWidth || !videoElem.videoHeight) return null;
-      canvasElem.width = videoElem.videoWidth;
-      canvasElem.height = videoElem.videoHeight;
+      const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(videoElem.videoWidth, videoElem.videoHeight));
+      canvasElem.width = Math.round(videoElem.videoWidth * scale);
+      canvasElem.height = Math.round(videoElem.videoHeight * scale);
       const ctx = canvasElem.getContext('2d');
-      ctx.drawImage(videoElem, 0, 0);
+      ctx.drawImage(videoElem, 0, 0, canvasElem.width, canvasElem.height);
 
-      const dataUrl = canvasElem.toDataURL('image/jpeg', 0.88);
+      const dataUrl = canvasElem.toDataURL('image/jpeg', 0.82);
       snapshotElem.src = dataUrl;
       snapshotElem.style.display = 'block';
       videoElem.style.display = 'none';
@@ -398,10 +404,24 @@
     function handleFileCapture(file) {
       const reader = new FileReader();
       reader.onload = (e) => {
-        snapshotElem.src = e.target.result;
-        snapshotElem.style.display = 'block';
-        videoElem.style.display = 'none';
-        sendImageToOllama(e.target.result.split(',', 2)[1]);
+        const image = new Image();
+        image.onload = () => {
+          const scale = Math.min(1, MAX_IMAGE_EDGE / Math.max(image.naturalWidth, image.naturalHeight));
+          canvasElem.width = Math.round(image.naturalWidth * scale);
+          canvasElem.height = Math.round(image.naturalHeight * scale);
+          const ctx = canvasElem.getContext('2d');
+          ctx.drawImage(image, 0, 0, canvasElem.width, canvasElem.height);
+          const dataUrl = canvasElem.toDataURL('image/jpeg', 0.82);
+          snapshotElem.src = dataUrl;
+          snapshotElem.style.display = 'block';
+          videoElem.style.display = 'none';
+          sendImageToOllama(dataUrl.split(',', 2)[1]);
+        };
+        image.onerror = () => {
+          resultContent.textContent = '图片解码失败，请重新拍摄。';
+          timingBadge.textContent = '图片无效';
+        };
+        image.src = e.target.result;
       };
       reader.readAsDataURL(file);
     }
@@ -437,7 +457,7 @@
           ],
           stream: false,
           format: "json",
-          options: { temperature: 0, seed: 42, num_ctx: 4096 }
+          options: { temperature: 0, seed: 42, num_ctx: 6144 }
         };
 
         const res = await fetch(CONFIG.apiEndpoint, {
@@ -526,7 +546,8 @@
     saveSettingsBtn.addEventListener('click', () => {
       CONFIG.apiEndpoint = urlInput.value.trim();
       CONFIG.modelName = modelInput.value.trim();
-      CONFIG.ttsRate = parseFloat(ttsRateSelect.value);
+      const selectedRate = Number.parseFloat(ttsRateSelect.value);
+      CONFIG.ttsRate = Number.isFinite(selectedRate) ? selectedRate : 1.0;
       if (!CONFIG.apiEndpoint || !CONFIG.modelName) {
         alert('接口地址和模型名称不能为空。');
         return;
