@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory=$true)]
     [string]$ImagePath,
     [string]$Model = "qwen3-vl:8b-instruct-q4_K_M",
