@@ -1,0 +1,9 @@
+windows-api/runtime/
+windows-api/models/
+windows-api/logs/
+*.gguf
+*.onnx
+*.bin
+*.log
+.DS_Store
+Thumbs.db
