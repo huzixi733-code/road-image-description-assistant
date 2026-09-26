@@ -1,4 +1,4 @@
-param([int]$Port = 11434)
+﻿param([int]$Port = 11434)
 
 $ErrorActionPreference = 'Stop'
 $taskExe = Join-Path $PSScriptRoot 'runtime/ollama.exe'
