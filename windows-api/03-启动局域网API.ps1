@@ -15,7 +15,7 @@ Get-Process -Name ollama -ErrorAction SilentlyContinue |
 $env:OLLAMA_HOST = "0.0.0.0:$Port"
 $env:OLLAMA_MODELS = Join-Path $PSScriptRoot 'models'
 $env:OLLAMA_NO_CLOUD = '1'
-$env:OLLAMA_CONTEXT_LENGTH = '4096'
+$env:OLLAMA_CONTEXT_LENGTH = '6144'
 $env:OLLAMA_FLASH_ATTENTION = '1'
 $env:OLLAMA_NUM_PARALLEL = '1'
 $env:OLLAMA_MAX_LOADED_MODELS = '1'
