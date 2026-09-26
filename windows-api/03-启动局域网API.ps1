@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Port = 11434,
     [switch]$AllowBrowserOrigins
 )
