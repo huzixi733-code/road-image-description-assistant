@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 $env:OLLAMA_HOST = '127.0.0.1:11434'
 $env:OLLAMA_MODELS = Join-Path $PSScriptRoot 'models'
 $env:OLLAMA_NO_CLOUD = '1'
