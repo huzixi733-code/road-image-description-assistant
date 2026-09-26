@@ -1,6 +1,7 @@
 windows-api/runtime/
 windows-api/models/
 windows-api/logs/
+phone-https/cloudflared.exe
 *.gguf
 *.onnx
 *.bin
