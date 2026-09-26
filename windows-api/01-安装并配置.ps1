@@ -1,4 +1,4 @@
-param([string]$Model = "qwen3-vl:8b-instruct-q4_K_M")
+﻿param([string]$Model = "qwen3-vl:8b-instruct-q4_K_M")
 $ErrorActionPreference = 'Stop'
 & (Join-Path $PSScriptRoot '00-start.ps1')
 & (Join-Path $PSScriptRoot 'runtime/ollama.exe') pull $Model
