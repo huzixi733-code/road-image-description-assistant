@@ -1,4 +1,4 @@
-$ErrorActionPreference = 'Stop'
+﻿$ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 $taskDialog = New-Object System.Windows.Forms.OpenFileDialog
 $taskDialog.Title = '选择需要描述的道路图片'
