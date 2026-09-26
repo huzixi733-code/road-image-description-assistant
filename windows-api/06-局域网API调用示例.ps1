@@ -27,7 +27,7 @@ $taskBody = @{
         images = @($taskImage)
     })
     options = @{
-        num_ctx = 4096
+        num_ctx = 6144
         num_predict = 220
         temperature = 0
         seed = 42
