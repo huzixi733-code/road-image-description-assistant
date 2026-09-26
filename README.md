@@ -10,12 +10,15 @@
 - 浏览器中文语音播报、重读、停止播报和振动反馈
 - 显示完整结构化 JSON，便于复盘提示词与模型输出
 - Ollama 地址、模型名称和播报速度可以在网页中修改
+- 手机照片会自动缩放到最长边 1280 像素，降低视觉 token 数和推理耗时
+- 支持同源 API 代理与临时 HTTPS 隧道，可在存在设备隔离的校园网使用
 
 ## 目录
 
 ```text
 web/          单页网页前端及纯 PowerShell 静态服务器
 windows-api/  Ollama 启动、图片描述、局域网接口和防火墙脚本
+phone-https/  Cloudflare 临时 HTTPS 隧道启动器
 ```
 
 ## 环境
@@ -58,6 +61,19 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\windows-api\02-描述道�
 
 网页会根据访问地址自动填写 Ollama 地址。部分手机浏览器不允许普通 HTTP 页面持续访问摄像头，此时会使用系统相机拍摄入口。
 
+模型上下文配置为 6144。网页会在发送前把手机相机或相册图片缩放到最长边 1280 像素，避免高分辨率照片超过上下文限制。
+
+## 校园网或不同网络下的手机访问
+
+校园网经常阻止同一 Wi-Fi 下的设备互相访问。此时不使用 `172.x.x.x` 局域网地址：
+
+1. 启动 Ollama API。
+2. 双击 `phone-https/手机访问_启动HTTPS.cmd`。
+3. 首次运行会下载 `cloudflared.exe` 并验证 Cloudflare 数字签名。
+4. 手机打开窗口显示的 `https://随机名称.trycloudflare.com` 地址。
+
+手机和电脑不必位于同一局域网，但电脑必须保持开机联网。图片及模型请求会通过 Cloudflare 加密转发到本机。临时地址不要分享给他人；关闭隧道窗口后地址失效，下次启动通常会变化。
+
 ## API
 
 ```text
@@ -66,7 +82,7 @@ GET  http://电脑IP:11434/api/tags
 POST http://电脑IP:11434/api/chat
 ```
 
-Ollama API 没有账号和密码。仅应在可信的专用局域网中开放，不要配置公网端口映射。
+Ollama API 没有账号和密码。仅应在可信的专用局域网中开放，不要配置公网端口映射。HTTPS 隧道只转发网页服务器提供的页面及 `/api/chat`、`/api/tags`、`/api/version` 路径。
 
 ## 输出原则
 
