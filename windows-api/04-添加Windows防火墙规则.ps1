@@ -1,4 +1,4 @@
-param([int]$Port = 11434)
+﻿param([int]$Port = 11434)
 
 $ErrorActionPreference = 'Stop'
 $taskRule = 'Qwen3-VL Road Assistant API'
