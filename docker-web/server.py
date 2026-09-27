@@ -28,6 +28,15 @@ class RoadAssistantHandler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=WEB_ROOT, **kwargs)
 
+    def end_headers(self):
+        """Prevent embedded mobile browsers from keeping stale HTML pages."""
+        request_path = urllib.parse.urlsplit(self.path).path
+        if request_path in ("", "/") or request_path.endswith(".html"):
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+        super().end_headers()
+
     def do_GET(self):
         if self.path == "/healthz":
             self._json(200, {"status": "ok"})
