@@ -286,6 +286,19 @@
         </select>
       </div>
       <div class="form-group">
+        <label>语音播报音高:</label>
+        <select id="tts-pitch-select">
+          <option value="0.9">偏低 (0.9)</option>
+          <option value="1.0" selected>标准 (1.0)</option>
+          <option value="1.1">偏高 (1.1)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label for="tts-voice-select">语音角色 (系统中文音色):</label>
+        <select id="tts-voice-select"></select>
+      </div>
+      <button id="btn-test-speech" class="btn-secondary" style="width: 100%; margin-bottom: 20px;">试听当前语音</button>
+      <div class="form-group">
         <label>模型结构化事实复盘 (最近一次推理):</label>
         <div id="debug-json" class="debug-box">暂无推理数据</div>
       </div>
@@ -298,11 +311,15 @@
     const DEFAULT_OLLAMA_URL = `${location.origin}/api/chat`;
     const SAVED_OLLAMA_URL = localStorage.getItem('ollama_url');
     const SAVED_TTS_RATE = Number.parseFloat(localStorage.getItem('tts_rate') || '1.0');
+    const SAVED_TTS_PITCH = Number.parseFloat(localStorage.getItem('tts_pitch') || '1.0');
+    const SAVED_TTS_VOICE = localStorage.getItem('tts_voice') || '';
     const MAX_IMAGE_EDGE = 1280;
     const CONFIG = {
       apiEndpoint: SAVED_OLLAMA_URL || DEFAULT_OLLAMA_URL,
       modelName: localStorage.getItem('ollama_model') || 'qwen3-vl:8b-instruct-q4_K_M',
       ttsRate: Number.isFinite(SAVED_TTS_RATE) ? SAVED_TTS_RATE : 1.0,
+      ttsPitch: Number.isFinite(SAVED_TTS_PITCH) ? SAVED_TTS_PITCH : 1.0,
+      ttsVoiceURI: SAVED_TTS_VOICE,
       systemPrompt: `任务:你是面向视障用户的道路图片描述助手。直接从关键目标及其位置开始,不使用“这是一张图片”“这是街景”等开场。
 信息顺序:优先描述清楚可见的近处障碍、台阶、坑洞、围挡和被占通道;其次描述行人、车辆、道路、路口、信号灯、标志与护栏的位置和空间关系。天空、天气和景观仅在影响识别时说明。
 方位:区分画面左、中、右与道路左、右车道。仅在透视明确时使用前方、近处、远处;不得仅凭目标在画面中的上下位置判断远近。
@@ -335,6 +352,9 @@
     const urlInput = document.getElementById('ollama-url');
     const modelInput = document.getElementById('model-name');
     const ttsRateSelect = document.getElementById('tts-rate-select');
+    const ttsPitchSelect = document.getElementById('tts-pitch-select');
+    const ttsVoiceSelect = document.getElementById('tts-voice-select');
+    const testSpeechBtn = document.getElementById('btn-test-speech');
 
     let currentStream = null;
     let isProcessing = false;
@@ -342,7 +362,8 @@
 
     urlInput.value = CONFIG.apiEndpoint;
     modelInput.value = CONFIG.modelName;
-    ttsRateSelect.value = CONFIG.ttsRate.toString();
+    setSelectByNumber(ttsRateSelect, CONFIG.ttsRate);
+    setSelectByNumber(ttsPitchSelect, CONFIG.ttsPitch);
 
     function triggerHaptic(pattern = 50) {
       if ('vibrate' in navigator) {
@@ -350,20 +371,225 @@
       }
     }
 
-    function speakText(text, interrupt = true) {
-      if (!('speechSynthesis' in window)) return;
-      if (interrupt) window.speechSynthesis.cancel();
-      if (!text || text.trim() === '') return;
+    /* ========== 语音播报模块 ========== */
+    const TTS_MAX_CHUNK = 40;
+    const TTS_GAP_MS = 40;
+    const TTS_RETRY_MS = 60;
+    const TTS_RETRY_MAX = 25;
 
-      const utterance = new SpeechSynthesisUtterance(text);
-      utterance.lang = 'zh-CN';
+    let ttsVoices = [];
+    let ttsVoice = null;
+    let ttsQueue = [];
+    let ttsToken = 0;
+    let ttsActive = false;
+    let ttsWatchdog = null;
+    let ttsUnlocked = false;
+    let activeUtterance = null;
+
+    function getSynth() {
+      return 'speechSynthesis' in window ? window.speechSynthesis : null;
+    }
+
+    function refreshVoices() {
+      const synth = getSynth();
+      if (!synth) return ttsVoices;
+      const list = synth.getVoices() || [];
+      if (list.length) ttsVoices = list;
+      return ttsVoices;
+    }
+
+    function pickChineseVoice() {
+      const list = refreshVoices();
+      let best = null;
+      let bestScore = -1;
+      for (const voice of list) {
+        const lang = (voice.lang || '').toLowerCase().replace('_', '-');
+        const name = (voice.name || '').toLowerCase();
+        if (lang.indexOf('zh') !== 0 && lang.indexOf('cmn') !== 0) continue;
+        let score = 50;
+        if (lang.indexOf('zh-cn') === 0 || lang.indexOf('zh-hans') === 0 || lang.indexOf('cmn-hans') === 0) score += 20;
+        if (lang.indexOf('zh-tw') === 0 || lang.indexOf('zh-hk') === 0) score -= 30;
+        if (/xiaoxiao|xiaoyi|yunxi|yunyang|yunjian|natural/.test(name)) score += 25;
+        if (name.indexOf('google') >= 0) score += 10;
+        if (voice.localService) score += 5;
+        if (voice.default) score += 3;
+        if (score > bestScore) { bestScore = score; best = voice; }
+      }
+      return best;
+    }
+
+    function applyVoiceSetting() {
+      ttsVoice = ttsVoices.find(v => v.voiceURI === CONFIG.ttsVoiceURI) || pickChineseVoice();
+      return ttsVoice;
+    }
+
+    function buildVoiceOptions() {
+      const list = refreshVoices();
+      const zhList = list.filter(v => /^(zh|cmn)/i.test((v.lang || '').replace('_', '-')));
+      const show = zhList.length ? zhList : list;
+      ttsVoiceSelect.innerHTML = '';
+      const auto = document.createElement('option');
+      auto.value = '';
+      auto.textContent = zhList.length ? '自动选择 (推荐)' : '未检测到中文语音,以下为全部音色';
+      ttsVoiceSelect.appendChild(auto);
+      for (const v of show) {
+        const opt = document.createElement('option');
+        opt.value = v.voiceURI;
+        opt.textContent = `${v.name} (${v.lang})`;
+        ttsVoiceSelect.appendChild(opt);
+      }
+    }
+
+    function syncVoiceSelect() {
+      const target = ttsVoice ? ttsVoice.voiceURI : '';
+      const exists = Array.prototype.some.call(ttsVoiceSelect.options, opt => opt.value === target);
+      ttsVoiceSelect.value = exists ? target : '';
+    }
+
+    function setSelectByNumber(select, value) {
+      let best = null;
+      let bestDiff = Infinity;
+      for (const opt of select.options) {
+        const diff = Math.abs(Number.parseFloat(opt.value) - value);
+        if (Number.isFinite(diff) && diff < bestDiff) { bestDiff = diff; best = opt; }
+      }
+      if (best) select.value = best.value;
+    }
+
+    function normalizeSpeechText(text) {
+      let out = String(text == null ? '' : text);
+      const matched = out.match(/"description"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+      if (matched) {
+        try { out = JSON.parse('"' + matched[1] + '"'); } catch (e) { out = matched[1]; }
+      }
+      out = out
+        .replace(/```[\s\S]*?```/g, ' ')
+        .replace(/`/g, '')
+        .replace(/[{}\[\]<>|\\^~=*_#]+/g, ' ')
+        .replace(/["'“”‘’]+/g, '')
+        .replace(/[\u200b-\u200f\ufeff\u2028\u2029]/g, '')
+        .replace(/[ \t\u3000]+/g, ' ')
+        .replace(/\s*\n+\s*/g, '。')
+        .replace(/([，。！？；：、,.!?;:])\1+/g, '$1')
+        .trim();
+      return out.replace(/^[，。！？；：、,.!?;:\s]+/, '').replace(/[，、,:：;；\s]+$/, '');
+    }
+
+    function splitSpeechText(text, maxLen = TTS_MAX_CHUNK) {
+      const HARD = '。！？；!?;';
+      const SOFT = '，、,:：';
+      const chunks = [];
+      let buf = '';
+      for (const ch of text) {
+        buf += ch;
+        const isHard = HARD.indexOf(ch) >= 0;
+        const isSoft = SOFT.indexOf(ch) >= 0;
+        if (isHard || (isSoft && buf.length >= maxLen * 0.6) || buf.length >= maxLen) {
+          const piece = buf.trim();
+          if (piece) chunks.push(piece);
+          buf = '';
+        }
+      }
+      const tail = buf.trim();
+      if (tail) chunks.push(tail);
+      return chunks.length ? chunks : [text];
+    }
+
+    function stopWatchdog() {
+      if (ttsWatchdog) { clearInterval(ttsWatchdog); ttsWatchdog = null; }
+    }
+
+    function startWatchdog() {
+      stopWatchdog();
+      ttsWatchdog = setInterval(() => {
+        const synth = getSynth();
+        if (!synth || !synth.speaking) return;
+        if (synth.paused) synth.resume();
+      }, 800);
+    }
+
+    function stopSpeaking() {
+      ttsToken++;
+      ttsQueue.length = 0;
+      ttsActive = false;
+      activeUtterance = null;
+      stopWatchdog();
+      const synth = getSynth();
+      if (synth) {
+        synth.cancel();
+        if (synth.paused) synth.resume();
+      }
+    }
+
+    function speakNext(token, retry = 0) {
+      if (token !== ttsToken) return;
+      const synth = getSynth();
+      if (!synth) return;
+      if (synth.speaking || synth.pending) {
+        if (retry > TTS_RETRY_MAX) { synth.cancel(); synth.resume(); }
+        setTimeout(() => speakNext(token, retry + 1), TTS_RETRY_MS);
+        return;
+      }
+
+      const piece = ttsQueue.shift();
+      if (!piece) { ttsActive = false; stopWatchdog(); return; }
+      if (synth.paused) synth.resume();
+
+      const utterance = new SpeechSynthesisUtterance(piece);
+      utterance.lang = (ttsVoice && ttsVoice.lang) || 'zh-CN';
       utterance.rate = Number.isFinite(CONFIG.ttsRate) ? CONFIG.ttsRate : 1.0;
-      window.speechSynthesis.speak(utterance);
+      utterance.pitch = Number.isFinite(CONFIG.ttsPitch) ? CONFIG.ttsPitch : 1.0;
+      utterance.volume = 1;
+      if (ttsVoice) utterance.voice = ttsVoice;
+
+      const advance = (delay) => {
+        activeUtterance = null;
+        if (token !== ttsToken) return;
+        stopWatchdog();
+        setTimeout(() => speakNext(token), delay);
+      };
+      utterance.onend = () => advance(TTS_GAP_MS);
+      utterance.onerror = (event) => advance(event && event.error === 'interrupted' ? 0 : TTS_RETRY_MS * 2);
+
+      activeUtterance = utterance;
+      startWatchdog();
+      synth.speak(utterance);
+    }
+
+    function speakText(text, interrupt = true) {
+      const synth = getSynth();
+      if (!synth) return false;
+      const clean = normalizeSpeechText(text);
+      if (!clean) return false;
+      if (interrupt) stopSpeaking();
+      if (!ttsVoice) applyVoiceSetting();
+      const token = ttsToken;
+      for (const piece of splitSpeechText(clean)) ttsQueue.push(piece);
+      if (!ttsActive) {
+        ttsActive = true;
+        speakNext(token);
+      }
+      return true;
+    }
+
+    function unlockSpeech() {
+      if (ttsUnlocked) return;
+      ttsUnlocked = true;
+      const synth = getSynth();
+      if (!synth || !/iP(hone|ad|od)/.test(navigator.userAgent)) return;
+      const utterance = new SpeechSynthesisUtterance(' ');
+      utterance.volume = 0;
+      synth.speak(utterance);
     }
 
     function announceSr(text) {
       srAnnouncer.textContent = '';
       setTimeout(() => { srAnnouncer.textContent = text; }, 50);
+    }
+
+    function speakAndAnnounce(text, interrupt = true) {
+      if (speakText(text, interrupt)) return;
+      announceSr(text);
     }
 
     async function initCamera() {
@@ -441,8 +667,7 @@
       resultContent.textContent = '正在识别前方路况，请稍候约7到8秒...';
 
       const notice = '已拍照，正在识别路况，请稍候。';
-      announceSr(notice);
-      speakText(notice, true);
+      speakAndAnnounce(notice);
 
       const startTime = performance.now();
 
@@ -483,15 +708,14 @@
         resultContent.textContent = desc;
 
         triggerHaptic([100, 60, 120]);
-        announceSr(desc);
-        speakText(desc, true);
+        speakAndAnnounce(desc);
 
       } catch (err) {
         const msg = '网络连接或模型响应失败，请检查设置中的IP地址。';
         resultContent.textContent = msg + ' (' + err.message + ')';
         timingBadge.textContent = '识别失败';
         triggerHaptic(300);
-        speakText(msg, true);
+        speakAndAnnounce(msg);
       } finally {
         isProcessing = false;
         captureBtn.disabled = false;
@@ -524,7 +748,8 @@
     });
 
     stopSpeechBtn.addEventListener('click', () => {
-      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      stopSpeaking();
+      triggerHaptic(30);
     });
 
     // 双击屏幕重听当前路况
@@ -544,17 +769,46 @@
     saveSettingsBtn.addEventListener('click', () => {
       CONFIG.apiEndpoint = urlInput.value.trim();
       CONFIG.modelName = modelInput.value.trim();
-      const selectedRate = Number.parseFloat(ttsRateSelect.value);
-      CONFIG.ttsRate = Number.isFinite(selectedRate) ? selectedRate : 1.0;
+      applySpeechOptions(true);
       if (!CONFIG.apiEndpoint || !CONFIG.modelName) {
         alert('接口地址和模型名称不能为空。');
         return;
       }
       localStorage.setItem('ollama_url', CONFIG.apiEndpoint);
       localStorage.setItem('ollama_model', CONFIG.modelName);
-      localStorage.setItem('tts_rate', CONFIG.ttsRate.toString());
       settingsModal.classList.remove('open');
       speakText('配置已保存');
+    });
+
+    function applySpeechOptions(persist) {
+      const rate = Number.parseFloat(ttsRateSelect.value);
+      CONFIG.ttsRate = Number.isFinite(rate) ? rate : 1.0;
+      const pitch = Number.parseFloat(ttsPitchSelect.value);
+      CONFIG.ttsPitch = Number.isFinite(pitch) ? pitch : 1.0;
+      CONFIG.ttsVoiceURI = ttsVoiceSelect.value || '';
+      applyVoiceSetting();
+      if (persist) {
+        localStorage.setItem('tts_rate', CONFIG.ttsRate.toString());
+        localStorage.setItem('tts_pitch', CONFIG.ttsPitch.toString());
+        localStorage.setItem('tts_voice', CONFIG.ttsVoiceURI);
+      }
+    }
+
+    ttsRateSelect.addEventListener('change', () => {
+      applySpeechOptions(true);
+      speakText('语速已调整');
+    });
+    ttsPitchSelect.addEventListener('change', () => {
+      applySpeechOptions(true);
+      speakText('音高已调整');
+    });
+    ttsVoiceSelect.addEventListener('change', () => {
+      applySpeechOptions(true);
+      speakText('占道围挡位于画面左侧,右侧车道可见一辆货车,请沿中间通道通行。');
+    });
+    testSpeechBtn.addEventListener('click', () => {
+      applySpeechOptions(true);
+      speakText('占道围挡位于画面左侧,右侧车道可见一辆货车,请沿中间通道通行。');
     });
 
     testConnBtn.addEventListener('click', async () => {
@@ -583,7 +837,27 @@
       }
     });
 
-    window.addEventListener('DOMContentLoaded', initCamera);
+    function initSpeech() {
+      const refresh = () => {
+        refreshVoices();
+        if (!ttsVoice) applyVoiceSetting();
+        buildVoiceOptions();
+        syncVoiceSelect();
+      };
+      refresh();
+      const synth = getSynth();
+      if (synth) synth.onvoiceschanged = refresh;
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && synth && synth.paused) synth.resume();
+      });
+      document.addEventListener('touchstart', unlockSpeech, { once: true, passive: true });
+      document.addEventListener('click', unlockSpeech, { once: true });
+    }
+
+    window.addEventListener('DOMContentLoaded', () => {
+      initCamera();
+      initSpeech();
+    });
   </script>
 </body>
 </html>
