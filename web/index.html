@@ -295,14 +295,12 @@
   <canvas id="hidden-canvas" style="display: none;"></canvas>
 
   <script>
-    const DEFAULT_OLLAMA_URL = location.protocol === 'https:'
-      ? `${location.origin}/api/chat`
-      : `http://${location.hostname || '127.0.0.1'}:11434/api/chat`;
+    const DEFAULT_OLLAMA_URL = `${location.origin}/api/chat`;
     const SAVED_OLLAMA_URL = localStorage.getItem('ollama_url');
     const SAVED_TTS_RATE = Number.parseFloat(localStorage.getItem('tts_rate') || '1.0');
     const MAX_IMAGE_EDGE = 1280;
     const CONFIG = {
-      apiEndpoint: location.protocol === 'https:' ? DEFAULT_OLLAMA_URL : (SAVED_OLLAMA_URL || DEFAULT_OLLAMA_URL),
+      apiEndpoint: SAVED_OLLAMA_URL || DEFAULT_OLLAMA_URL,
       modelName: localStorage.getItem('ollama_model') || 'qwen3-vl:8b-instruct-q4_K_M',
       ttsRate: Number.isFinite(SAVED_TTS_RATE) ? SAVED_TTS_RATE : 1.0,
       systemPrompt: `任务:你是面向视障用户的道路图片描述助手。直接从关键目标及其位置开始,不使用“这是一张图片”“这是街景”等开场。

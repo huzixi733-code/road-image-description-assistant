@@ -6,5 +6,7 @@ phone-https/cloudflared.exe
 *.onnx
 *.bin
 *.log
+__pycache__/
+*.pyc
 .DS_Store
 Thumbs.db

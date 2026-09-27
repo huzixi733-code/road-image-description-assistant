@@ -19,6 +19,7 @@
 web/          单页网页前端及纯 PowerShell 静态服务器
 windows-api/  Ollama 启动、图片描述、局域网接口和防火墙脚本
 phone-https/  Cloudflare 临时 HTTPS 隧道启动器
+docker-web/   Docker Web 服务及外部 Ollama 同源代理
 ```
 
 ## 环境
@@ -73,6 +74,31 @@ powershell -NoProfile -ExecutionPolicy Bypass -File ".\windows-api\02-描述道�
 4. 手机打开窗口显示的 `https://随机名称.trycloudflare.com` 地址。
 
 手机和电脑不必位于同一局域网，但电脑必须保持开机联网。图片及模型请求会通过 Cloudflare 加密转发到本机。临时地址不要分享给他人；关闭隧道窗口后地址失效，下次启动通常会变化。
+
+## Docker Web 部署与 WireGuard 模型服务
+
+Web 服务和模型可以分开运行：Docker 容器只提供网页与同源 API 代理，Windows 模型电脑继续使用 Ollama 和 GPU。以下示例中，模型电脑的 WireGuard 地址是 `10.0.0.102`，Docker 将宿主机 `8880` 映射到容器 `80`：
+
+```bash
+cd /opt/road-assistant
+OLLAMA_BASE=http://10.0.0.102:11434 PORT=80 \
+  nohup ./docker-web/start.sh >web.log 2>&1 </dev/null &
+```
+
+Windows 模型电脑需要让 Ollama 监听局域网地址，并以管理员身份运行：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File ".\windows-api\07-允许WireGuard访问API.ps1"
+```
+
+部署后分别检查 Web 服务和模型代理：
+
+```text
+http://服务器地址:8880/healthz
+http://服务器地址:8880/api/tags
+```
+
+完整说明见 `docker-web/README.md`。网页默认使用同源 `/api/chat`，因此浏览器不需要直接访问模型电脑的 `11434` 端口。
 
 ## API
 
