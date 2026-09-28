@@ -6,13 +6,13 @@ const vm = require('node:vm');
 
 const frontend = path.resolve(__dirname, '../web/index.html');
 
-function harness({ nativeCamera = false, blocked = false } = {}) {
+function harness({ nativeCamera = false, blocked = false, platform = 'iPhone', nativeSpeech = true, voices = [], audioBlocked = false } = {}) {
   const html = fs.readFileSync(frontend, 'utf8');
   const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   // Exercise the production speech queue and photo/result handlers with a fake
   // engine: mobile playback requires an audible utterance during a user click.
   const speech = script.slice(script.indexOf('    const TTS_MAX_CHUNK'), script.indexOf('    async function initCamera'));
-  const photo = script.slice(script.indexOf('    function inferenceError'), script.indexOf("    reReadBtn.addEventListener"));
+  const photo = script.slice(script.indexOf('    function inferenceError'), script.indexOf('    // 双击屏幕重听'));
   let clock = 0;
   let nextId = 1;
   const timers = new Map();
@@ -24,15 +24,20 @@ function harness({ nativeCamera = false, blocked = false } = {}) {
   let resolveResponse;
   let rejectResponse;
   const requests = [];
+  const speechRequests = [];
+  const revokedAudio = [];
+  const audioPlays = [];
+  let resolveSpeech;
+  let audio;
   const elements = {};
-  for (const name of ['captureBtn', 'captureBtnText', 'fallbackCaptureBtn', 'nativeFileInput', 'timingBadge', 'resultContent', 'debugBox', 'snapshotElem', 'videoElem', 'srAnnouncer']) {
+  for (const name of ['captureBtn', 'captureBtnText', 'fallbackCaptureBtn', 'nativeFileInput', 'timingBadge', 'resultContent', 'debugBox', 'snapshotElem', 'videoElem', 'srAnnouncer', 'serverPlayBtn', 'ttsStatusElem', 'ttsPitchSelect', 'ttsVoiceSelect', 'reReadBtn', 'stopSpeechBtn']) {
     elements[name] = { textContent: '', style: {}, listeners: {}, addEventListener(type, fn) { this.listeners[type] = fn; } };
   }
   elements.nativeFileInput.click = () => { clicks++; };
   elements.videoElem.videoWidth = nativeCamera ? 0 : 640;
   const synth = {
     speaking: false, pending: false, paused: false,
-    getVoices: () => [],
+    getVoices: () => voices,
     cancel() { cancels++; this.speaking = false; this.pending = false; },
     resume() { this.paused = false; },
     speak(utterance) {
@@ -49,7 +54,21 @@ function harness({ nativeCamera = false, blocked = false } = {}) {
   const context = vm.createContext({
     ...elements, console,
     CONFIG: { ttsRate: 1, ttsPitch: 1, ttsVoiceURI: '', apiEndpoint: '/api/chat', modelName: 'existing-model', systemPrompt: 'existing-prompt' },
-    window: { speechSynthesis: synth }, navigator: { userAgent: 'iPhone' },
+    window: { speechSynthesis: nativeSpeech ? synth : undefined }, navigator: { userAgent: platform },
+    Audio: function() {
+      audio = this; this.src = ''; this.currentTime = 0;
+      this.setAttribute = () => {}; this.pause = () => {};
+      this.play = () => {
+        audioPlays.push({ src: this.src, inGesture });
+        if (audioBlocked && this.src.startsWith('blob:') && !inGesture) {
+          const error = new Error('User activation required'); error.name = 'NotAllowedError';
+          return Promise.reject(error);
+        }
+        return Promise.resolve();
+      };
+    },
+    AbortController,
+    URL: { createObjectURL: () => 'blob:speech-' + nextId++, revokeObjectURL: url => revokedAudio.push(url) },
     SpeechSynthesisUtterance: function(text) { this.text = text; },
     setTimeout(fn, delay) { const id = nextId++; timers.set(id, { fn, at: clock + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -59,13 +78,19 @@ function harness({ nativeCamera = false, blocked = false } = {}) {
     captureVideoFrame: () => 'photo-base64',
     handleFileCapture: () => vm.runInContext("sendImageToOllama('photo-base64')", context),
     fetch: (url, options) => {
+      if (url === '/api/tts/status') return Promise.resolve({ ok: true, json: async () => ({ available: true }) });
+      if (url === '/api/tts') {
+        speechRequests.push({ url, payload: JSON.parse(options.body), signal: options.signal });
+        return new Promise(resolve => { resolveSpeech = resolve; });
+      }
       requests.push({ url, payload: JSON.parse(options.body) });
       return new Promise((resolve, reject) => { resolveResponse = resolve; rejectResponse = reject; });
     }
   });
   vm.runInContext(speech + photo, context);
   return {
-    spoken, elements, requests, get cancels() { return cancels; }, get clicks() { return clicks; },
+    spoken, elements, requests, speechRequests, revokedAudio, audioPlays,
+    get audio() { return audio; }, get cancels() { return cancels; }, get clicks() { return clicks; },
     call(code) { return vm.runInContext(code, context); },
     click(name) { inGesture = true; try { elements[name].listeners.click(); } finally { inGesture = false; } },
     end() { synth.speaking = false; spoken.at(-1).onend?.(); },
@@ -93,6 +118,15 @@ function harness({ nativeCamera = false, blocked = false } = {}) {
     async disconnect() {
       rejectResponse(new TypeError('Failed to fetch'));
       await new Promise(resolve => setImmediate(resolve));
+    },
+    async respondSpeech(ok = true) {
+      resolveSpeech({ ok, headers: { get: () => 'audio/wav' }, blob: async () => ({ size: 2048 }) });
+      await new Promise(resolve => setImmediate(resolve));
+    },
+    playAudioFromGesture() {
+      inGesture = true;
+      try { vm.runInContext('playPreparedServerAudio(ttsToken)', context); }
+      finally { inGesture = false; }
     }
   };
 }
@@ -254,4 +288,72 @@ test('new recognition clears the previous photo description before a failure', a
   h.end(); h.advance(40);
   h.click('captureBtn'); await h.respondHttp(500, 'model runner failed');
   assert.equal(h.call('lastDescription'), '');
+});
+
+test('Android with no native speech interface uses same-origin server WAV audio', async () => {
+  const h = harness({ platform: 'Android MicroMessenger', nativeSpeech: false });
+  h.click('captureBtn');
+  assert.equal(h.spoken.length, 0);
+  assert.equal(h.speechRequests[0].url, '/api/tts');
+  assert.equal(h.speechRequests[0].payload.text, '已拍照，正在识别路况，请稍候。');
+  assert.equal(h.audioPlays[0].inGesture, true, 'prime audio during the photo click');
+  await h.respondSpeech();
+  assert.ok(h.audio.src.startsWith('blob:'));
+  await h.respond('前方有护栏。');
+  await h.respondSpeech();
+  assert.equal(h.speechRequests.at(-1).payload.text, '前方有护栏。');
+  assert.ok(h.revokedAudio.length > 0);
+});
+
+test('Android without Chinese voices falls back, while Android with Chinese and iOS retain native speech', () => {
+  const empty = harness({ platform: 'Android' }); empty.click('captureBtn');
+  assert.equal(empty.speechRequests.length, 1);
+  const chinese = harness({ platform: 'Android', voices: [{ voiceURI: 'mandarin', lang: 'zh-CN', name: 'Chinese' }] });
+  chinese.click('captureBtn');
+  assert.equal(chinese.spoken.length, 1);
+  assert.equal(chinese.speechRequests.length, 0);
+  const ios = harness(); ios.click('captureBtn');
+  assert.equal(ios.spoken.length, 1);
+  assert.equal(ios.speechRequests.length, 0);
+});
+
+test('blocked Android autoplay provides a direct user-gesture play action without regenerating audio', async () => {
+  const h = harness({ platform: 'Android', nativeSpeech: false, audioBlocked: true });
+  h.click('captureBtn'); await h.respondSpeech();
+  assert.equal(h.elements.serverPlayBtn.style.display, '');
+  const source = h.audio.src;
+  h.click('serverPlayBtn');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.elements.serverPlayBtn.style.display, 'none');
+  assert.equal(h.audio.src, source);
+  assert.equal(h.speechRequests.length, 1);
+  assert.equal(h.audioPlays.at(-1).inGesture, true);
+});
+
+test('stop cancels server synthesis and a late WAV cannot resume stopped playback', async () => {
+  const h = harness({ platform: 'Android', nativeSpeech: false });
+  h.click('captureBtn');
+  h.click('stopSpeechBtn');
+  assert.equal(h.speechRequests[0].signal.aborted, true);
+  await h.respondSpeech();
+  assert.equal(h.call('serverAudioUrl'), null);
+  assert.equal(h.elements.serverPlayBtn.style.display, 'none');
+});
+
+test('server speech failure keeps recognition text and reports a readable status', async () => {
+  const h = harness({ platform: 'Android', nativeSpeech: false });
+  h.click('captureBtn'); await h.respondSpeech(false);
+  await h.respond('前方有台阶。'); await h.respondSpeech(false);
+  assert.equal(h.elements.resultContent.textContent, '前方有台阶。');
+  assert.match(h.elements.ttsStatusElem.textContent, /服务器语音暂时无法播放/);
+});
+
+test('Android native playback failure falls back to server audio without repeating engine errors', async () => {
+  const h = harness({ platform: 'Android', blocked: true, voices: [{ voiceURI: 'mandarin', lang: 'zh-CN', name: 'Chinese' }] });
+  h.click('captureBtn'); h.advance(0);
+  assert.equal(h.spoken.length, 1);
+  assert.equal(h.speechRequests.length, 1);
+  assert.equal(h.speechRequests[0].payload.text, '已拍照，正在识别路况，请稍候。');
+  await h.respondSpeech();
+  assert.ok(h.audio.src.startsWith('blob:'));
 });

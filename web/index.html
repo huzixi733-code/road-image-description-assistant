@@ -220,7 +220,7 @@
     .result-label::before { content: ""; width: 8px; height: 8px; border-radius: 50%; background: var(--primary); box-shadow: 0 0 0 5px var(--primary-soft); }
     #timing-badge { color: var(--text-muted); font-size: 0.78rem; }
     .result-text { font-size: clamp(1.22rem, 5.3vw, 1.55rem); line-height: 1.68; font-weight: 570; letter-spacing: 0.015em; word-break: break-word; }
-    .result-meta { margin-top: 18px; display: flex; align-items: center; justify-content: flex-end; border-top: 1px solid var(--border); padding-top: 13px; }
+    .result-meta { margin-top: 18px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; justify-content: flex-end; border-top: 1px solid var(--border); padding-top: 13px; }
     .action-pill-btn {
       min-height: 40px;
       padding: 8px 15px;
@@ -393,6 +393,7 @@
         轻触下方按钮拍照，我们将为您识别并朗读前方路况。
       </div>
       <div class="result-meta">
+        <button id="btn-play-audio" class="action-pill-btn" style="display: none;" aria-label="播放已生成的路况语音">点击播放语音</button>
         <button id="btn-stop-speech" class="action-pill-btn" aria-label="停止朗读">停止播报</button>
       </div>
     </section>
@@ -462,8 +463,9 @@
           </select>
         </div>
         <div class="form-group">
-          <label for="tts-voice-select">语音角色（系统中文音色）</label>
+          <label for="tts-voice-select">语音角色</label>
           <select id="tts-voice-select"></select>
+          <p id="tts-status" role="status" style="margin: 12px 0 0; color: #b9c9dc; font-size: 14px; line-height: 1.6;">正在检测可用语音…</p>
         </div>
         <button id="btn-test-speech" class="btn-secondary btn-wide">试听当前语音</button>
       </section>
@@ -512,6 +514,7 @@
     const cameraStatus = document.getElementById('camera-status');
     const reReadBtn = document.getElementById('btn-re-read');
     const stopSpeechBtn = document.getElementById('btn-stop-speech');
+    const serverPlayBtn = document.getElementById('btn-play-audio');
     const debugBox = document.getElementById('debug-json');
 
     const settingsModal = document.getElementById('settings-modal');
@@ -524,6 +527,7 @@
     const ttsRateSelect = document.getElementById('tts-rate-select');
     const ttsPitchSelect = document.getElementById('tts-pitch-select');
     const ttsVoiceSelect = document.getElementById('tts-voice-select');
+    const ttsStatusElem = document.getElementById('tts-status');
     const testSpeechBtn = document.getElementById('btn-test-speech');
 
     let currentStream = null;
@@ -555,15 +559,33 @@
     let ttsWatchdog = null;
     let ttsStartTimer = null;
     let activeUtterance = null;
+    const SERVER_VOICE_URI = 'server:zh-CN';
+    let ttsCurrentText = '';
+    let serverVoiceAvailable = null;
+    let serverAudio = null;
+    let serverAudioUrl = null;
+    let serverAudioPrimed = false;
+    let serverPreparedText = '';
+    let serverQueue = [];
+    let serverSpeechActive = false;
+    let serverRequest = null;
+
+    function isIOSDevice() {
+      return /iP(hone|ad|od)/.test(navigator.userAgent) ||
+        (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    }
 
     function getSynth() {
-      return 'speechSynthesis' in window ? window.speechSynthesis : null;
+      const synth = window.speechSynthesis;
+      return synth && typeof synth.speak === 'function' && typeof synth.getVoices === 'function' &&
+        typeof SpeechSynthesisUtterance !== 'undefined' ? synth : null;
     }
 
     function refreshVoices() {
       const synth = getSynth();
       if (!synth) return ttsVoices;
-      const list = synth.getVoices() || [];
+      let list = [];
+      try { list = synth.getVoices() || []; } catch (error) {}
       if (list.length) ttsVoices = list;
       return ttsVoices;
     }
@@ -600,20 +622,152 @@
       ttsVoiceSelect.innerHTML = '';
       const auto = document.createElement('option');
       auto.value = '';
-      auto.textContent = zhList.length ? '自动选择 (推荐)' : '未检测到中文语音,以下为全部音色';
+      auto.textContent = shouldUseServerSpeech() ? '自动选择服务器中文语音' : '自动选择 (系统中文音色)';
       ttsVoiceSelect.appendChild(auto);
+      const serverOption = document.createElement('option');
+      serverOption.value = SERVER_VOICE_URI;
+      serverOption.textContent = '中文普通话（服务器音频）';
+      ttsVoiceSelect.appendChild(serverOption);
       for (const v of show) {
         const opt = document.createElement('option');
         opt.value = v.voiceURI;
         opt.textContent = `${v.name} (${v.lang})`;
         ttsVoiceSelect.appendChild(opt);
       }
+      updateSpeechStatus();
     }
 
     function syncVoiceSelect() {
-      const target = ttsVoice ? ttsVoice.voiceURI : '';
+      const target = CONFIG.ttsVoiceURI === SERVER_VOICE_URI ? SERVER_VOICE_URI : (ttsVoice ? ttsVoice.voiceURI : '');
       const exists = Array.prototype.some.call(ttsVoiceSelect.options, opt => opt.value === target);
       ttsVoiceSelect.value = exists ? target : '';
+    }
+
+    function shouldUseServerSpeech() {
+      if (CONFIG.ttsVoiceURI === SERVER_VOICE_URI || !getSynth()) return true;
+      // iOS continues using its working system engine, including delayed voices.
+      return !isIOSDevice() && !pickChineseVoice();
+    }
+
+    function updateSpeechStatus() {
+      const remote = shouldUseServerSpeech();
+      if (remote) {
+        ttsStatusElem.textContent = serverVoiceAvailable === false
+          ? '手机未提供中文音色，服务器语音暂不可用。识别文字仍可查看。'
+          : '使用服务器中文音频，无需手机安装中文音色。若未自动播放，可点击“播放语音”。';
+      } else {
+        ttsStatusElem.textContent = '使用手机系统中文语音。';
+      }
+      ttsPitchSelect.disabled = remote;
+      if (remote) ttsStatusElem.textContent += ' 服务器音频支持语速调整，音高固定。';
+    }
+
+    async function checkServerSpeech() {
+      try {
+        const res = await fetch('/api/tts/status', { cache: 'no-store' });
+        const status = res.ok ? await res.json() : null;
+        serverVoiceAvailable = !!(status && status.available);
+      } catch (error) { serverVoiceAvailable = false; }
+      updateSpeechStatus();
+    }
+
+    function getServerAudio() {
+      if (!serverAudio) {
+        serverAudio = new Audio();
+        serverAudio.preload = 'auto';
+        serverAudio.setAttribute('playsinline', '');
+      }
+      return serverAudio;
+    }
+
+    function clearServerAudio() {
+      if (serverRequest) { serverRequest.abort(); serverRequest = null; }
+      serverQueue.length = 0;
+      serverSpeechActive = false;
+      if (serverAudio) { serverAudio.pause(); serverAudio.onended = null; serverAudio.onerror = null; }
+      if (serverAudioUrl) { URL.revokeObjectURL(serverAudioUrl); serverAudioUrl = null; }
+      serverPreparedText = '';
+      serverPlayBtn.style.display = 'none';
+    }
+
+    function primeServerAudio(token) {
+      if (serverAudioPrimed) return;
+      const audio = getServerAudio();
+      audio.src = '/api/tts/silence.wav';
+      const started = audio.play();
+      if (started && started.then) started.then(() => {
+        serverAudioPrimed = true;
+        if (token === ttsToken && !serverAudioUrl) audio.pause();
+      }).catch(() => {});
+    }
+
+    function reportServerSpeechFailure(token, text) {
+      if (token !== ttsToken) return;
+      serverSpeechActive = false;
+      serverQueue.length = 0;
+      ttsStatusElem.textContent = '服务器语音暂时无法播放，请稍后点击重读。';
+      timingBadge.textContent += ' · 语音未播放';
+      announceSr(text);
+    }
+
+    function playPreparedServerAudio(token) {
+      if (token !== ttsToken || !serverAudioUrl) return;
+      const audio = getServerAudio();
+      const started = audio.play();
+      if (started && started.then) started.then(() => {
+        if (token !== ttsToken) return;
+        serverAudioPrimed = true;
+        serverPlayBtn.style.display = 'none';
+      }).catch((error) => {
+        if (token !== ttsToken) return;
+        if (error.name === 'NotAllowedError') {
+          serverPlayBtn.style.display = '';
+          ttsStatusElem.textContent = '语音已生成，请点击“播放语音”开始播报。';
+        } else if (error.name !== 'AbortError') reportServerSpeechFailure(token, serverPreparedText);
+      });
+    }
+
+    async function speakServerNext(token) {
+      if (token !== ttsToken) return;
+      const text = serverQueue.shift();
+      if (!text) { serverSpeechActive = false; return; }
+      const controller = new AbortController();
+      serverRequest = controller;
+      const timeout = setTimeout(() => controller.abort(), 45000);
+      try {
+        const res = await fetch('/api/tts', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text, rate: CONFIG.ttsRate }), signal: controller.signal
+        });
+        if (!res.ok || !(res.headers.get('Content-Type') || '').includes('audio/wav')) {
+          throw new Error('服务器语音暂不可用');
+        }
+        const blob = await res.blob();
+        if (token !== ttsToken) return;
+        if (serverAudioUrl) URL.revokeObjectURL(serverAudioUrl);
+        serverAudioUrl = URL.createObjectURL(blob);
+        serverPreparedText = text;
+        const audio = getServerAudio();
+        audio.src = serverAudioUrl;
+        audio.onended = () => { if (token === ttsToken) speakServerNext(token); };
+        audio.onerror = () => reportServerSpeechFailure(token, text);
+        playPreparedServerAudio(token);
+      } catch (error) {
+        if (token === ttsToken) reportServerSpeechFailure(token, text);
+      } finally {
+        clearTimeout(timeout);
+        if (serverRequest === controller) serverRequest = null;
+      }
+    }
+
+    function speakServerText(text, interrupt) {
+      if (typeof Audio === 'undefined' || typeof AbortController === 'undefined') return false;
+      if (interrupt) stopSpeaking();
+      ttsCurrentText = text;
+      primeServerAudio(ttsToken);
+      serverQueue.push(text);
+      if (!serverSpeechActive) { serverSpeechActive = true; speakServerNext(ttsToken); }
+      return true;
     }
 
     function setSelectByNumber(select, value) {
@@ -681,6 +835,7 @@
 
     function stopSpeaking() {
       ttsToken++;
+      clearServerAudio();
       ttsQueue.length = 0;
       ttsActive = false;
       activeUtterance = null;
@@ -694,6 +849,9 @@
     }
 
     function reportSpeechFailure() {
+      if (!isIOSDevice() && ttsCurrentText) {
+        if (speakServerText(ttsCurrentText, true)) return;
+      }
       stopSpeaking();
       const hint = '语音未能播放，请点击顶部重读按钮。';
       if (!timingBadge.textContent.includes(hint)) timingBadge.textContent += ' · ' + hint;
@@ -759,11 +917,13 @@
     }
 
     function speakText(text, interrupt = true) {
-      const synth = getSynth();
-      if (!synth) return false;
       const clean = normalizeSpeechText(text);
       if (!clean) return false;
+      if (shouldUseServerSpeech()) return speakServerText(clean, interrupt);
+      const synth = getSynth();
+      if (!synth) return false;
       if (interrupt) stopSpeaking();
+      ttsCurrentText = clean;
       if (!ttsVoice) applyVoiceSetting();
       const token = ttsToken;
       for (const piece of splitSpeechText(clean)) ttsQueue.push(piece);
@@ -1012,8 +1172,13 @@
     });
 
     reReadBtn.addEventListener('click', () => {
-      if (lastDescription) speakText(lastDescription, true);
+      if (lastDescription && serverAudioUrl && serverPreparedText === normalizeSpeechText(lastDescription)) {
+        getServerAudio().currentTime = 0;
+        playPreparedServerAudio(ttsToken);
+      } else if (lastDescription) speakText(lastDescription, true);
     });
+
+    serverPlayBtn.addEventListener('click', () => playPreparedServerAudio(ttsToken));
 
     stopSpeechBtn.addEventListener('click', () => {
       stopSpeaking();
@@ -1032,7 +1197,11 @@
       lastTap = now;
     });
 
-    openSettingsBtn.addEventListener('click', () => settingsModal.classList.add('open'));
+    openSettingsBtn.addEventListener('click', () => {
+      refreshVoices(); applyVoiceSetting(); buildVoiceOptions(); syncVoiceSelect();
+      checkServerSpeech();
+      settingsModal.classList.add('open');
+    });
     closeSettingsBtn.addEventListener('click', () => settingsModal.classList.remove('open'));
     saveSettingsBtn.addEventListener('click', () => {
       CONFIG.apiEndpoint = urlInput.value.trim();
@@ -1055,6 +1224,7 @@
       CONFIG.ttsPitch = Number.isFinite(pitch) ? pitch : 1.0;
       CONFIG.ttsVoiceURI = ttsVoiceSelect.value || '';
       applyVoiceSetting();
+      updateSpeechStatus();
       if (persist) {
         localStorage.setItem('tts_rate', CONFIG.ttsRate.toString());
         localStorage.setItem('tts_pitch', CONFIG.ttsPitch.toString());
@@ -1113,6 +1283,9 @@
         syncVoiceSelect();
       };
       refresh();
+      checkServerSpeech();
+      // Some Android engines load voices without sending voiceschanged.
+      for (let attempt = 1; attempt <= 6; attempt++) setTimeout(refresh, attempt * 500);
       const synth = getSynth();
       if (synth) synth.onvoiceschanged = refresh;
       document.addEventListener('visibilitychange', () => {

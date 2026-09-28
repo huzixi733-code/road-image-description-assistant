@@ -4,6 +4,9 @@ windows-api/logs/
 phone-https/cloudflared.exe
 *.gguf
 *.onnx
+.tts-venv/
+docker-web/tts-models/
+tts-models/
 *.bin
 *.log
 __pycache__/
