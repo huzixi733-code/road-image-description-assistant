@@ -553,7 +553,7 @@
     let ttsToken = 0;
     let ttsActive = false;
     let ttsWatchdog = null;
-    let ttsUnlocked = false;
+    let ttsStartTimer = null;
     let activeUtterance = null;
 
     function getSynth() {
@@ -667,6 +667,7 @@
 
     function stopWatchdog() {
       if (ttsWatchdog) { clearInterval(ttsWatchdog); ttsWatchdog = null; }
+      if (ttsStartTimer) { clearTimeout(ttsStartTimer); ttsStartTimer = null; }
     }
 
     function startWatchdog() {
@@ -686,18 +687,27 @@
       stopWatchdog();
       const synth = getSynth();
       if (synth) {
-        synth.cancel();
+        // 首次播放时保持用户点击内的直接 speak，不取消空闲引擎。
+        if (synth.speaking || synth.pending) synth.cancel();
         if (synth.paused) synth.resume();
       }
     }
 
-    function speakNext(token, retry = 0) {
+    function reportSpeechFailure() {
+      stopSpeaking();
+      const hint = '语音未能播放，请点击顶部重读按钮。';
+      if (!timingBadge.textContent.includes(hint)) timingBadge.textContent += ' · ' + hint;
+      announceSr(hint);
+    }
+
+    function speakNext(token, retry = 0, recovery = 0) {
       if (token !== ttsToken) return;
       const synth = getSynth();
       if (!synth) return;
       if (synth.speaking || synth.pending) {
-        if (retry > TTS_RETRY_MAX) { synth.cancel(); synth.resume(); }
-        setTimeout(() => speakNext(token, retry + 1), TTS_RETRY_MS);
+        if (retry > TTS_RETRY_MAX + 1) { reportSpeechFailure(); return; }
+        if (retry === TTS_RETRY_MAX) { synth.cancel(); synth.resume(); }
+        setTimeout(() => speakNext(token, retry + 1, recovery), TTS_RETRY_MS);
         return;
       }
 
@@ -712,18 +722,40 @@
       utterance.volume = 1;
       if (ttsVoice) utterance.voice = ttsVoice;
 
-      const advance = (delay) => {
+      let settled = false;
+      const isCurrent = () => !settled && token === ttsToken && activeUtterance === utterance;
+      const settle = () => {
+        if (!isCurrent()) return false;
+        settled = true;
         activeUtterance = null;
-        if (token !== ttsToken) return;
         stopWatchdog();
-        setTimeout(() => speakNext(token), delay);
+        return true;
       };
-      utterance.onend = () => advance(TTS_GAP_MS);
-      utterance.onerror = (event) => advance(event && event.error === 'interrupted' ? 0 : TTS_RETRY_MS * 2);
+      const recover = (error) => {
+        if (!settle()) return;
+        // 播放失败时重试原句，不让第一段被直接丢弃。
+        if (error === 'not-allowed' || recovery >= 1) {
+          reportSpeechFailure();
+          return;
+        }
+        ttsQueue.unshift(piece);
+        synth.cancel();
+        if (synth.paused) synth.resume();
+        setTimeout(() => speakNext(token, 0, recovery + 1), TTS_RETRY_MS * 2);
+      };
+      utterance.onstart = () => {
+        if (!isCurrent()) return;
+        if (ttsStartTimer) { clearTimeout(ttsStartTimer); ttsStartTimer = null; }
+      };
+      utterance.onend = () => {
+        if (settle()) setTimeout(() => speakNext(token), TTS_GAP_MS);
+      };
+      utterance.onerror = (event) => recover(event && event.error);
 
       activeUtterance = utterance;
       startWatchdog();
-      synth.speak(utterance);
+      ttsStartTimer = setTimeout(() => recover('start-timeout'), 5000);
+      try { synth.speak(utterance); } catch (error) { recover('synthesis-failed'); }
     }
 
     function speakText(text, interrupt = true) {
@@ -742,14 +774,11 @@
       return true;
     }
 
-    function unlockSpeech() {
-      if (ttsUnlocked) return;
-      ttsUnlocked = true;
-      const synth = getSynth();
-      if (!synth || !/iP(hone|ad|od)/.test(navigator.userAgent)) return;
-      const utterance = new SpeechSynthesisUtterance(' ');
-      utterance.volume = 0;
-      synth.speak(utterance);
+    function openNativeCamera() {
+      // 在点击事件内播放可听见的提示，再进入相机的异步读取流程。
+      speakAndAnnounce('请拍照，返回后将自动播报路况。');
+      nativeFileInput.value = '';
+      nativeFileInput.click();
     }
 
     function announceSr(text) {
@@ -904,11 +933,11 @@
         const b64 = captureVideoFrame();
         if (b64) sendImageToOllama(b64);
       } else {
-        nativeFileInput.click();
+        openNativeCamera();
       }
     });
 
-    fallbackCaptureBtn.addEventListener('click', () => nativeFileInput.click());
+    fallbackCaptureBtn.addEventListener('click', openNativeCamera);
     nativeFileInput.addEventListener('change', (e) => {
       if (e.target.files && e.target.files[0]) handleFileCapture(e.target.files[0]);
     });
@@ -1020,8 +1049,7 @@
       document.addEventListener('visibilitychange', () => {
         if (!document.hidden && synth && synth.paused) synth.resume();
       });
-      document.addEventListener('touchstart', unlockSpeech, { once: true, passive: true });
-      document.addEventListener('click', unlockSpeech, { once: true });
+      // 拍照、重读和试听按钮直接启动语音，不再追加静音空文本。
     }
 
     window.addEventListener('DOMContentLoaded', () => {
